@@ -5,10 +5,12 @@ from typing import Any
 
 from .checkpoint import load_checkpoint_safe, load_checkpoint_unsafe
 from .inspect_pt import (
+    build_inspection_report,
     collect_mapping_entries,
     detect_checkpoint_kind,
     detect_task_hints,
     find_state_dict,
+    framework_from_unsupported_global,
 )
 from .spec import validate_spec_file
 
@@ -98,29 +100,32 @@ def assess_export_from_model_path(
             load_checkpoint_unsafe(path) if unsafe_load else load_checkpoint_safe(path)
         )
     except Exception as exc:
+        framework_hint = framework_from_unsupported_global(str(exc))
+        if framework_hint is not None:
+            detected_source = _source_from_framework_hint(path, framework_hint, str(exc))
+            official = _assess_official_exporter(detected_source, resolved_target, spec=None)
+            toolkit = _checkpoint_toolkit_unknown(resolved_target)
+            return {
+                "input_mode": "checkpoint",
+                "path": str(path),
+                "requested_target_format": resolved_target,
+                "load_mode": "unsafe_trusted_local" if unsafe_load else "safe_weights_only",
+                "load_warnings": [str(exc)],
+                "detected_source": detected_source,
+                "official_source_exporter": official,
+                "toolkit_generic_exporter": toolkit,
+                "recommended_route": _recommend_route(detected_source, official, toolkit, resolved_target),
+            }
         mode = "unsafe" if unsafe_load else "safe"
         raise RuntimeError(
             f"{mode} checkpoint loading failed during preliminary assessment: {exc}"
         ) from exc
 
     checkpoint = load_result.checkpoint
-    detected_source = _detect_source_from_checkpoint(path, checkpoint, max_items=max_items)
+    report = build_inspection_report(path, checkpoint, max_items=max_items)
+    detected_source = _detect_source_from_checkpoint(path, checkpoint, max_items=max_items, report=report)
     official = _assess_official_exporter(detected_source, resolved_target, spec=None)
-    toolkit = {
-        "status": "unknown",
-        "target_format": resolved_target,
-        "confidence": "low",
-        "evidence": [
-            "checkpoint-path assessment does not include model.module, model.class_name, input spec, or output spec"
-        ],
-        "blockers": [],
-        "unknowns": [
-            "model construction is unavailable without a spec",
-            "checkpoint loading rule is not declared in a spec",
-            "input/output contract is unavailable without a spec",
-            "dry-run forward was not attempted",
-        ],
-    }
+    toolkit = _checkpoint_toolkit_unknown(resolved_target)
     recommendation = _recommend_route(detected_source, official, toolkit, resolved_target)
     if recommendation["route"] == "toolkit_generic_exporter":
         recommendation = {
@@ -216,8 +221,55 @@ def _detect_source_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _checkpoint_toolkit_unknown(target_format: str) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "target_format": target_format,
+        "confidence": "low",
+        "evidence": [
+            "checkpoint-path assessment does not include model.module, model.class_name, input spec, or output spec"
+        ],
+        "blockers": [],
+        "unknowns": [
+            "model construction is unavailable without a spec",
+            "checkpoint loading rule is not declared in a spec",
+            "input/output contract is unavailable without a spec",
+            "dry-run forward was not attempted",
+        ],
+    }
+
+
+def _source_from_framework_hint(path: Path, hint: Any, error_text: str) -> dict[str, Any]:
+    model_family = "unknown"
+    task = "unknown"
+    lower = error_text.lower()
+    if hint.framework == "ultralytics":
+        model_family = "yolo"
+        if "segmentationmodel" in lower:
+            task = "segmentation"
+        elif "detectionmodel" in lower:
+            task = "object_detection"
+    elif hint.framework == "anomalib":
+        task = "anomaly_detection"
+        if "patchcore" in lower:
+            model_family = "patchcore"
+        elif "reverse_distillation" in lower or "reversedistillation" in lower:
+            model_family = "reverse_distillation"
+    return {
+        "framework": hint.framework,
+        "model_family": model_family,
+        "task": task,
+        "status": "inferred",
+        "confidence": hint.confidence,
+        "evidence": [
+            f"safe checkpoint loading failed for {path.name} with framework-specific global",
+            *hint.evidence,
+        ],
+    }
+
+
 def _detect_source_from_checkpoint(
-    path: Path, checkpoint: Any, max_items: int
+    path: Path, checkpoint: Any, max_items: int, report: Any | None = None
 ) -> dict[str, Any]:
     checkpoint_kind = detect_checkpoint_kind(checkpoint, path)
     state_dict_name, state_dict = find_state_dict(checkpoint)
@@ -237,10 +289,40 @@ def _detect_source_from_checkpoint(
 
     framework = "unknown"
     model_family = "unknown"
+    task = "unknown"
     status = "unknown"
     confidence = "low"
 
-    if "ultralytics" in type_name or "ultralytics" in lowered_blob:
+    if report and report.framework_hints:
+        best_hint = sorted(
+            report.framework_hints,
+            key=lambda item: 0 if item.confidence == "high" else 1,
+        )[0]
+        framework = best_hint.framework
+        status = "inferred"
+        confidence = best_hint.confidence
+        evidence.extend(best_hint.evidence)
+        if framework == "ultralytics":
+            model_family = "yolo"
+            hint_evidence = " ".join(best_hint.evidence).lower()
+            segmentation_high = any(
+                task_name == "segmentation" and task_confidence == "high"
+                for task_name, task_confidence, _ in task_hints
+            )
+            detection_present = any(
+                task_name == "object_detection" for task_name, _, _ in task_hints
+            )
+            if "segmentationmodel" in hint_evidence or segmentation_high:
+                task = "segmentation"
+            elif "detectionmodel" in hint_evidence or detection_present:
+                task = "object_detection"
+        elif framework == "anomalib":
+            task = "anomaly_detection"
+            if "patchcore" in lowered_blob or "memory_bank" in lowered_blob:
+                model_family = "patchcore"
+            elif "reverse_distillation" in lowered_blob or "reversedistillation" in lowered_blob:
+                model_family = "reverse_distillation"
+    elif "ultralytics" in type_name or "ultralytics" in lowered_blob:
         framework = "ultralytics"
         model_family = "yolo" if "yolo" in lowered_blob or "yolo" in type_name else "unknown"
         status = "inferred"
@@ -268,10 +350,11 @@ def _detect_source_from_checkpoint(
         elif model_family == "unknown" and task_name == "object_detection":
             model_family = "object_detection"
 
+    resolved_task = task if task != "unknown" else (task_hints[0][0] if task_hints else "unknown")
     return {
         "framework": framework,
         "model_family": model_family,
-        "task": task_hints[0][0] if task_hints else "unknown",
+        "task": resolved_task,
         "status": status,
         "confidence": confidence,
         "evidence": evidence,

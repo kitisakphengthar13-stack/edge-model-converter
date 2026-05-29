@@ -2,24 +2,41 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .checkpoint import (
     load_checkpoint_safe,
     load_checkpoint_unsafe,
     summarize_loaded_checkpoint,
 )
+from .compare import compare_onnx, render_compare_text
 from .dry_run import run_model_dry_run
 from .export_assessment import (
     assess_export_from_model_path,
     assess_export_from_spec,
 )
-from .inspect_pt import inspect_checkpoint
+from .inspect_pt import build_inspection_report, inspect_checkpoint, print_inspection_report
 from .load_plan import print_loading_plan
 from .onnx_export import export_onnx_from_spec
-from .onnx_validate import parse_cli_shape, validate_onnx_file
+from .onnx_validate import (
+    build_onnx_inspection_report,
+    parse_cli_shape,
+    print_onnx_report,
+    validate_onnx_file,
+)
+from .readiness import SUPPORTED_READINESS_PROFILES
+from .reports import (
+    envelope_from_onnx_report,
+    envelope_from_pytorch_report,
+    messages_reach_threshold,
+    render_markdown_envelope,
+    render_scan_markdown,
+)
+from .scan import scan_artifacts
 from .spec import SpecValidationResult, print_validation_result, validate_spec_file
 from .tensorrt_plan import create_tensorrt_plan
 from .utils import print_section
@@ -33,11 +50,16 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m converter.cli",
+        prog="edge-inspect",
         description=(
-            "Inspect PyTorch checkpoints, manage model specs, export ONNX, "
-            "and validate ONNX inference."
+            "Inspect PyTorch checkpoints and ONNX artifacts for edge deployment readiness."
         ),
+        epilog="Backward compatible module entrypoint: python -m converter.cli",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"edge-inspect {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -57,6 +79,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow full pickle loading for trusted local files only.",
     )
+    inspect_parser.add_argument(
+        "--json",
+        dest="json_output",
+        help="Optional path to write a structured JSON inspection report.",
+    )
+    inspect_parser.add_argument(
+        "--format",
+        choices=("text", "json", "markdown"),
+        default="text",
+        help="Output format. Default: text.",
+    )
+    inspect_parser.add_argument("--output", help="Optional report output path.")
     inspect_parser.set_defaults(func=inspect_command)
 
     validate_spec_parser = subparsers.add_parser(
@@ -209,12 +243,87 @@ def build_parser() -> argparse.ArgumentParser:
     validate_onnx_parser.add_argument("--input-dtype", help="Override input dtype.")
     validate_onnx_parser.add_argument("--input-name", help="Override input name.")
     validate_onnx_parser.add_argument(
+        "--target",
+        choices=SUPPORTED_READINESS_PROFILES,
+        default="generic",
+        help="Edge readiness target profile. Default: generic.",
+    )
+    validate_onnx_parser.add_argument(
         "--max-items",
         type=int,
         default=20,
         help="Maximum number of inputs, outputs, or summaries to print. Default: 20.",
     )
+    validate_onnx_parser.add_argument(
+        "--json",
+        dest="json_output",
+        help="Optional path to write a structured JSON ONNX inspection report.",
+    )
+    validate_onnx_parser.add_argument(
+        "--format",
+        choices=("text", "json", "markdown"),
+        default="text",
+        help="Output format. Default: text.",
+    )
+    validate_onnx_parser.add_argument("--output", help="Optional report output path.")
+    validate_onnx_parser.add_argument(
+        "--fail-on",
+        choices=("warning", "error"),
+        help="Return nonzero if the report contains this severity or higher.",
+    )
     validate_onnx_parser.set_defaults(func=validate_onnx_command)
+
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="Batch inspect supported PyTorch checkpoint and ONNX artifacts.",
+    )
+    scan_parser.add_argument("path", help="Directory, file, or glob to scan.")
+    scan_parser.add_argument(
+        "--include",
+        action="append",
+        help="Include pattern for directory scans. Can be repeated.",
+    )
+    scan_parser.add_argument(
+        "--unsafe-load",
+        action="store_true",
+        help="Allow unsafe trusted-local PyTorch checkpoint loading during scan.",
+    )
+    scan_parser.add_argument("--input-shape", help="Comma-separated ONNX dummy input shape.")
+    scan_parser.add_argument(
+        "--target",
+        choices=SUPPORTED_READINESS_PROFILES,
+        default="generic",
+        help="Edge readiness target profile for ONNX artifacts. Default: generic.",
+    )
+    scan_parser.add_argument(
+        "--format",
+        choices=("text", "json", "markdown"),
+        default="text",
+        help="Output format. Default: text.",
+    )
+    scan_parser.add_argument("--output", help="Optional aggregate report output path.")
+    scan_parser.add_argument(
+        "--fail-on",
+        choices=("warning", "error"),
+        help="Return nonzero if any scanned report contains this severity or higher.",
+    )
+    scan_parser.add_argument("--max-items", type=int, default=20)
+    scan_parser.set_defaults(func=scan_command)
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="Compare two artifacts. ONNX-vs-ONNX is supported first.",
+    )
+    compare_parser.add_argument("left")
+    compare_parser.add_argument("right")
+    compare_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. Default: text.",
+    )
+    compare_parser.add_argument("--output", help="Optional comparison output path.")
+    compare_parser.set_defaults(func=compare_command)
 
     plan_tensorrt_parser = subparsers.add_parser(
         "plan-tensorrt",
@@ -277,7 +386,25 @@ def inspect_command(args: argparse.Namespace) -> int:
             )
         return 2
 
-    inspect_checkpoint(path, checkpoint, max_items=args.max_items)
+    report = build_inspection_report(path, checkpoint, max_items=args.max_items)
+    envelope = envelope_from_pytorch_report(report.to_dict())
+    if args.format == "markdown":
+        rendered = render_markdown_envelope(envelope)
+        _emit_or_write(rendered, args.output)
+    elif args.format == "json":
+        rendered = json.dumps(envelope.to_dict(), indent=2) + "\n"
+        _emit_or_write(rendered, args.output)
+    else:
+        print_inspection_report(report, max_items=args.max_items)
+    if args.json_output:
+        output_path = Path(args.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(report.to_dict(), file, indent=2)
+            file.write("\n")
+    if args.output and args.format == "text":
+        rendered = render_markdown_envelope(envelope) if args.output.lower().endswith(".md") else json.dumps(envelope.to_dict(), indent=2) + "\n"
+        _emit_or_write(rendered, args.output)
     return 0
 
 
@@ -435,22 +562,113 @@ def validate_onnx_command(args: argparse.Namespace) -> int:
 
     try:
         shape = parse_cli_shape(args.input_shape) if args.input_shape else None
-        result = validate_onnx_file(
+        report = build_onnx_inspection_report(
             args.path,
             spec_path=args.spec,
             input_shape=shape,
             input_dtype=args.input_dtype,
             input_name=args.input_name,
             max_items=args.max_items,
+            target=args.target,
+        )
+        result = report.to_dict() | {
+            "onnx_path": report.path,
+            "checker_passed": report.validation.checker_passed,
+            "ort_session_created": report.validation.ort_session_created,
+            "inference_passed": report.validation.inference_passed,
+            "input_names": [item.name for item in report.inputs],
+            "output_names": [item.name for item in report.outputs],
+            "success": report.validation.checker_passed and report.validation.ort_session_created,
+        }
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    envelope = envelope_from_onnx_report(result)
+    if args.format == "markdown":
+        _emit_or_write(render_markdown_envelope(envelope), args.output)
+    elif args.format == "json":
+        _emit_or_write(json.dumps(envelope.to_dict(), indent=2) + "\n", args.output)
+    else:
+        print_onnx_report(report, max_items=args.max_items)
+        print_section("Validation result")
+        for key in (
+            "onnx_path",
+            "checker_passed",
+            "ort_session_created",
+            "inference_passed",
+            "success",
+        ):
+            print(f"{key}: {result.get(key)}")
+    if args.json_output:
+        output_path = Path(args.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(result, file, indent=2)
+            file.write("\n")
+        print(f"json_report: {output_path}")
+    if args.output and args.format == "text":
+        _emit_or_write(json.dumps(envelope.to_dict(), indent=2) + "\n", args.output)
+    return 3 if messages_reach_threshold(envelope.warnings, envelope.errors, args.fail_on) else 0
+
+
+def scan_command(args: argparse.Namespace) -> int:
+    try:
+        shape = parse_cli_shape(args.input_shape) if args.input_shape else None
+        envelopes = scan_artifacts(
+            args.path,
+            includes=args.include,
+            unsafe_load=args.unsafe_load,
+            input_shape=shape,
+            max_items=args.max_items,
+            target=args.target,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    print_section("Validation result")
-    for key, value in result.items():
-        print(f"{key}: {value}")
+    payload = {"artifacts": [item.to_dict() for item in envelopes]}
+    if args.format == "json":
+        rendered = json.dumps(payload, indent=2) + "\n"
+    elif args.format == "markdown":
+        rendered = render_scan_markdown(envelopes)
+    else:
+        rendered = render_scan_markdown(envelopes)
+    _emit_or_write(rendered, args.output)
+    triggered = any(
+        messages_reach_threshold(item.warnings, item.errors, args.fail_on)
+        for item in envelopes
+    )
+    return 3 if triggered else 0
+
+
+def compare_command(args: argparse.Namespace) -> int:
+    left = Path(args.left)
+    right = Path(args.right)
+    if left.suffix.lower() != ".onnx" or right.suffix.lower() != ".onnx":
+        print("Error: compare currently supports ONNX-vs-ONNX only.", file=sys.stderr)
+        return 2
+    try:
+        result = compare_onnx(str(left), str(right))
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    rendered = (
+        json.dumps(result, indent=2) + "\n"
+        if args.format == "json"
+        else render_compare_text(result)
+    )
+    _emit_or_write(rendered, args.output)
     return 0
+
+
+def _emit_or_write(text: str, output: str | None) -> None:
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text, encoding="utf-8")
+    else:
+        print(text, end="")
 
 
 def plan_tensorrt_command(args: argparse.Namespace) -> int:
@@ -579,7 +797,7 @@ def _next_suggested_actions(result: dict[str, Any]) -> list[str]:
             "then validate the produced ONNX with validate-onnx",
         ]
     if route == "toolkit_generic_exporter":
-        return ["use python -m converter.cli export-onnx with the assessed spec"]
+        return ["use edge-inspect export-onnx with the assessed spec"]
     if result["input_mode"] == "checkpoint":
         return ["create or refine a spec before attempting export"]
     return ["review blockers and unknowns before choosing an export route"]

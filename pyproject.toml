@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-model-inspector"
+version = "0.1.0"
+description = "CLI toolkit for inspecting PyTorch checkpoints and ONNX artifacts for edge deployment readiness."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Edge Model Inspector Contributors" }
+]
+keywords = ["onnx", "pytorch", "edge-ai", "model-inspection", "tensorrt"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch",
+  "pyyaml",
+  "onnx",
+  "onnxscript",
+  "onnxruntime",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+edge-inspect = "converter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["converter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
